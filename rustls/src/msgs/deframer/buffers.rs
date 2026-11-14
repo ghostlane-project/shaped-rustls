@@ -7,6 +7,10 @@ use std::io;
 #[cfg(feature = "std")]
 use crate::msgs::message::MAX_WIRE_SIZE;
 
+/// The read offered to a deframer buffer that holds nothing.
+#[cfg(feature = "std")]
+pub(crate) const READ_SIZE: usize = 4096;
+
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
 #[derive(Debug)]
@@ -191,6 +195,12 @@ impl DeframerVecBuffer {
     pub(crate) fn filled(&self) -> &[u8] {
         &self.buf[..self.used]
     }
+
+    /// Bytes the buffer holds allocated, used or not.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
 }
 
 #[cfg(feature = "std")]
@@ -216,8 +226,6 @@ impl DeframerVecBuffer {
         /// restrict that to 64KB to limit potential for denial-of-
         /// service.
         const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
-
-        const READ_SIZE: usize = 4096;
 
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
         // by varying the maximum allowed buffer size here based on whether a prefix of a
@@ -299,5 +307,118 @@ impl<'a> DeframerSliceBuffer<'a> {
 
     pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
         &mut self.buf[self.discard..]
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    /// A TLS 1.3 record at the largest size a peer sends: 16 KiB of plaintext,
+    /// its content type and a 16-byte tag.
+    const FULL_RECORD_PAYLOAD: usize = 16_384 + 1 + 16;
+
+    /// An application-data record with `payload_len` bytes of payload.
+    fn record(payload_len: usize) -> Vec<u8> {
+        let mut record = Vec::with_capacity(5 + payload_len);
+        record.extend_from_slice(&[0x17, 0x03, 0x03]);
+        record.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        record.extend((0..payload_len).map(|i| (i % 251) as u8));
+        record
+    }
+
+    /// Reads `bytes` into `buf` as a socket would deliver them: in `pieces`
+    /// (the last one repeated), each read taking at most what the buffer
+    /// offers. Between reads nothing is discarded, as when
+    /// `process_new_packets()` finds only a partial record.
+    fn read_in_pieces(buf: &mut DeframerVecBuffer, bytes: &[u8], pieces: &[usize]) {
+        let mut offset = 0;
+        let mut pieces = pieces.iter().copied();
+        let mut piece = 0;
+        while offset < bytes.len() {
+            piece = pieces.next().unwrap_or(piece);
+            let end = Ord::min(bytes.len(), offset.saturating_add(piece));
+            while offset < end {
+                let n = buf
+                    .read(&mut &bytes[offset..end], false)
+                    .unwrap();
+                assert!(
+                    n > 0,
+                    "the buffer offered no room at {offset} of {}",
+                    bytes.len()
+                );
+                offset += n;
+                buf.discard(0);
+                assert_eq!(buf.filled(), &bytes[..offset]);
+            }
+        }
+    }
+
+    #[test]
+    fn drained_buffer_holds_no_allocation() {
+        let mut buf = DeframerVecBuffer::default();
+        let full = record(FULL_RECORD_PAYLOAD);
+        read_in_pieces(&mut buf, &full, &[usize::MAX]);
+        assert!(buf.capacity() >= full.len());
+
+        buf.discard(full.len());
+        assert!(buf.filled().is_empty());
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn empty_buffer_offers_a_small_read_then_the_rest_of_the_record() {
+        let mut buf = DeframerVecBuffer::default();
+        let full = record(FULL_RECORD_PAYLOAD);
+
+        let first = buf.read(&mut &full[..], false).unwrap();
+        assert_eq!(first, READ_SIZE);
+        assert!(buf.capacity() <= READ_SIZE);
+
+        // The rest of the record comes in one read.
+        let rest = buf
+            .read(&mut &full[first..], false)
+            .unwrap();
+        assert_eq!(first + rest, full.len());
+        assert_eq!(buf.filled(), &full[..]);
+    }
+
+    #[test]
+    fn largest_record_arrives_in_pieces_after_release() {
+        let mut buf = DeframerVecBuffer::default();
+        let full = record(FULL_RECORD_PAYLOAD);
+        read_in_pieces(&mut buf, &full, &[usize::MAX]);
+        buf.discard(full.len());
+        assert_eq!(buf.capacity(), 0);
+
+        // A 16 KiB record, its header split, then pieces across the small read.
+        read_in_pieces(&mut buf, &full, &[1, 4, 3, 4_093, 5_000, 1, usize::MAX]);
+        buf.discard(full.len());
+        assert_eq!(buf.capacity(), 0);
+
+        // The largest record the deframer takes, MAX_WIRE_SIZE bytes on the wire.
+        let largest = record(MAX_WIRE_SIZE - 5);
+        read_in_pieces(&mut buf, &largest, &[2, 4_096, 7, 1_000]);
+        assert_eq!(buf.filled().len(), MAX_WIRE_SIZE);
+        buf.discard(largest.len());
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn partly_consumed_buffer_keeps_the_rest() {
+        let mut buf = DeframerVecBuffer::default();
+        let mut two = record(FULL_RECORD_PAYLOAD);
+        let second = record(300);
+        two.extend_from_slice(&second);
+        read_in_pieces(&mut buf, &two, &[usize::MAX]);
+
+        buf.discard(two.len() - second.len());
+        assert_eq!(buf.filled(), &second[..]);
+        assert!(buf.capacity() >= second.len());
+
+        buf.discard(second.len());
+        assert_eq!(buf.capacity(), 0);
     }
 }

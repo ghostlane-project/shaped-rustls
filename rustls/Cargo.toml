@@ -97,6 +97,10 @@ name = "ech"
 path = "tests/ech.rs"
 
 [[test]]
+name = "idle_memory"
+path = "tests/idle_memory.rs"
+
+[[test]]
 name = "key_log_file_env"
 path = "tests/runners/key_log_file_env.rs"
 
