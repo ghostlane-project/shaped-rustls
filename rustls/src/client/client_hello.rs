@@ -744,6 +744,11 @@ impl ClientHelloExactExtension {
                     "ClientHello exact extension type cannot be pre_shared_key".into(),
                 ));
             }
+            ExtensionType::ApplicationSettings | ExtensionType::ApplicationSettingsOld => {
+                return Err(Error::General(
+                    "ClientHello exact extension type cannot be application_settings; use ClientHelloApplicationSettings".into(),
+                ));
+            }
             _ => {}
         }
 
@@ -882,6 +887,173 @@ impl TryFrom<Vec<ClientHelloRawExtension>> for ClientHelloRawExtensions {
         }
 
         Ok(Self(value))
+    }
+}
+
+/// The codepoint a ClientHello offers ALPS (application_settings) at.
+///
+/// ALPS (draft-vvv-tls-alps) has two codepoints in use, both BoringSSL's:
+/// the draft's `0x4469` and the newer `0x44cd`, whose client
+/// EncryptedExtensions is the same. A server answers at the codepoint the
+/// client offered; an answer at the other one is unsolicited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientHelloApplicationSettingsCodepoint {
+    /// `0x4469`, BoringSSL's `TLSEXT_TYPE_application_settings_old`.
+    Old,
+    /// `0x44cd`, BoringSSL's `TLSEXT_TYPE_application_settings`.
+    New,
+}
+
+impl ClientHelloApplicationSettingsCodepoint {
+    /// The extension type's IANA-style u16 value.
+    pub fn value(self) -> u16 {
+        u16::from(self.extension_type())
+    }
+
+    pub(crate) fn extension_type(self) -> ExtensionType {
+        match self {
+            Self::Old => ExtensionType::ApplicationSettingsOld,
+            Self::New => ExtensionType::ApplicationSettings,
+        }
+    }
+}
+
+/// One protocol a ClientHello offers ALPS for, and the settings the client
+/// sends for it when the server picks that protocol and answers with its own.
+///
+/// The settings are opaque here: for `h2` a browser sends HTTP/2 frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloApplicationProtocol {
+    protocol: Vec<u8>,
+    settings: Vec<u8>,
+}
+
+impl ClientHelloApplicationProtocol {
+    /// Offer ALPS for `protocol` (an ALPN protocol name), with `settings` as
+    /// the client's own.
+    ///
+    /// The settings go into one extension of the client's
+    /// EncryptedExtensions, so they are bounded by its u16 length.
+    pub fn new(protocol: Vec<u8>, settings: Vec<u8>) -> Result<Self, Error> {
+        if protocol.is_empty() {
+            return Err(Error::General(
+                "ClientHello application_settings protocol name cannot be empty".into(),
+            ));
+        }
+        if protocol.len() > usize::from(u8::MAX) {
+            return Err(Error::General(
+                "ClientHello application_settings protocol name cannot exceed 255 bytes".into(),
+            ));
+        }
+        if settings.len() > usize::from(u16::MAX) {
+            return Err(Error::General(
+                "ClientHello application_settings settings cannot exceed 65535 bytes".into(),
+            ));
+        }
+
+        Ok(Self { protocol, settings })
+    }
+
+    /// Return the protocol name.
+    pub fn protocol(&self) -> &[u8] {
+        &self.protocol
+    }
+
+    /// Return the client's settings for the protocol.
+    pub fn settings(&self) -> &[u8] {
+        &self.settings
+    }
+}
+
+/// ALPS (application_settings, draft-vvv-tls-alps) for the ClientHello: the
+/// codepoint and the protocols it is offered for, in order, as BoringSSL
+/// offers it.
+///
+/// A connection that offers it accepts the server's settings in the
+/// server's EncryptedExtensions (TLS 1.3 only) for the ALPN protocol the
+/// server picked, and then sends its own in an EncryptedExtensions message
+/// of its own, before its Certificate and Finished. The server's settings
+/// are then [`crate::ClientConnection::peer_application_settings`].
+///
+/// rustls emits nothing for ALPS without this, and the codepoints cannot be
+/// written as raw or exact extensions: the extension and the handshake
+/// would disagree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientHelloApplicationSettings {
+    codepoint: ClientHelloApplicationSettingsCodepoint,
+    protocols: Vec<ClientHelloApplicationProtocol>,
+}
+
+impl ClientHelloApplicationSettings {
+    /// Offer ALPS at `codepoint` for `protocols`, in that order.
+    ///
+    /// The list cannot be empty nor name a protocol twice, and its encoding
+    /// must fit the extension's u16 length.
+    pub fn new(
+        codepoint: ClientHelloApplicationSettingsCodepoint,
+        protocols: Vec<ClientHelloApplicationProtocol>,
+    ) -> Result<Self, Error> {
+        if protocols.is_empty() {
+            return Err(Error::General(
+                "ClientHello application_settings protocols cannot be empty".into(),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut encoded_len = 2usize;
+        for protocol in &protocols {
+            if !seen.insert(protocol.protocol.as_slice()) {
+                return Err(Error::General(
+                    "ClientHello application_settings protocols contain a duplicate value".into(),
+                ));
+            }
+            encoded_len += 1 + protocol.protocol.len();
+        }
+        if encoded_len > usize::from(u16::MAX) {
+            return Err(Error::General(
+                "ClientHello application_settings extension cannot exceed 65535 bytes".into(),
+            ));
+        }
+
+        Ok(Self {
+            codepoint,
+            protocols,
+        })
+    }
+
+    /// Return the codepoint.
+    pub fn codepoint(&self) -> ClientHelloApplicationSettingsCodepoint {
+        self.codepoint
+    }
+
+    /// Return the protocols, in offer order.
+    pub fn protocols(&self) -> &[ClientHelloApplicationProtocol] {
+        &self.protocols
+    }
+
+    /// The ClientHello extension body: a u16-prefixed list of u8-prefixed
+    /// protocol names, as ALPN's.
+    pub(crate) fn extension_body(&self) -> Vec<u8> {
+        let names_len: usize = self
+            .protocols
+            .iter()
+            .map(|protocol| 1 + protocol.protocol.len())
+            .sum();
+        let mut body = Vec::with_capacity(2 + names_len);
+        // `new` bounds the encoding by u16::MAX.
+        body.extend_from_slice(&(names_len as u16).to_be_bytes());
+        for protocol in &self.protocols {
+            body.push(protocol.protocol.len() as u8);
+            body.extend_from_slice(&protocol.protocol);
+        }
+        body
+    }
+
+    /// The client's settings for `protocol`, if ALPS is offered for it.
+    pub(crate) fn settings_for(&self, protocol: &[u8]) -> Option<&[u8]> {
+        self.protocols
+            .iter()
+            .find(|offered| offered.protocol == protocol)
+            .map(|offered| offered.settings.as_slice())
     }
 }
 
@@ -1228,6 +1400,7 @@ pub struct ClientHelloPlan {
         Option<ClientHelloCertificateCompressionAlgorithms>,
     pub(crate) exact_extensions: Option<ClientHelloExactExtensions>,
     pub(crate) raw_extensions: Option<ClientHelloRawExtensions>,
+    pub(crate) application_settings: Option<ClientHelloApplicationSettings>,
     pub(crate) grease: Option<ClientHelloGreasePlan>,
     pub(crate) grease_ech: Option<EchGreaseConfig>,
     pub(crate) padding: Option<ClientHelloPaddingPlan>,
@@ -1391,6 +1564,17 @@ impl ClientHelloPlan {
     /// Add raw unknown ClientHello extensions.
     pub fn with_raw_extensions(mut self, extensions: ClientHelloRawExtensions) -> Self {
         self.raw_extensions = Some(extensions);
+        self
+    }
+
+    /// Offer ALPS (application_settings) and answer a server that accepts
+    /// it, as BoringSSL does: only in a hello that offers TLS 1.3 and ALPN,
+    /// and left out of any other.
+    pub fn with_application_settings(
+        mut self,
+        application_settings: ClientHelloApplicationSettings,
+    ) -> Self {
+        self.application_settings = Some(application_settings);
         self
     }
 

@@ -20,7 +20,11 @@ This branch adds primitives for:
 * fixed ClientHello random and session ID values;
 * custom and advertised cipher suites;
 * supported versions, supported groups, and signature algorithm shaping;
-* custom extension ordering, disabling, forced/raw/exact extensions, and ALPS;
+* custom extension ordering, disabling, and forced/raw/exact extensions;
+* ALPS (application_settings, draft-vvv-tls-alps) as BoringSSL's client does
+  it: the offer at either codepoint (`0x4469`, `0x44cd`), the server's settings
+  read from its EncryptedExtensions, and the client's own sent in an
+  EncryptedExtensions of the client's before its Finished (TLS 1.3 only);
 * GREASE values and GREASE extension placement;
 * raw key shares and fixed X25519 key shares, including the classical X25519
   component inside hybrid `X25519MLKEM768` key shares;

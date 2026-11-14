@@ -8,6 +8,7 @@ use subtle::ConstantTimeEq;
 use super::client_conn::ClientConnectionData;
 use super::hs::{ClientContext, ClientHelloInput, ClientSessionValue};
 use crate::check::inappropriate_handshake_message;
+use crate::client::client_hello::ClientHelloApplicationSettings;
 use crate::client::common::{ClientAuthDetails, ClientHelloDetails, ServerCertDetails};
 use crate::client::ech::{self, EchState, EchStatus};
 use crate::client::{ClientConfig, ClientHelloPlan, ClientSessionStore, hs};
@@ -739,6 +740,68 @@ fn validate_encrypted_extensions(
     Ok(())
 }
 
+/// The client's ALPS (application_settings), owed to a server that
+/// accepted the offer: sent in the client's EncryptedExtensions, at the
+/// codepoint offered. At most 65535 bytes of settings
+/// (`ClientHelloApplicationProtocol::new`).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ApplicationSettingsReply {
+    extension_type: ExtensionType,
+    settings: Vec<u8>,
+}
+
+impl ApplicationSettingsReply {
+    /// The client's EncryptedExtensions message: one extension, ALPS.
+    pub(super) fn encrypted_extensions(&self) -> HandshakeMessagePayload<'static> {
+        let mut exts = ServerExtensions::default();
+        let settings = Some(Payload::new(self.settings.clone()));
+        match self.extension_type {
+            ExtensionType::ApplicationSettingsOld => exts.application_settings_old = settings,
+            _ => exts.application_settings = settings,
+        }
+        HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(Box::new(exts)))
+    }
+}
+
+/// Reads the server's ALPS in its EncryptedExtensions against the offer,
+/// as BoringSSL's client does: settings for the protocol ALPN selected, and
+/// only with ALPN; with early data accepted ALPS is not negotiated anew,
+/// so the server must not send it. (An answer at the codepoint not offered
+/// is refused before this as unsolicited.)
+///
+/// Returns the server's settings and the client's reply when ALPS was
+/// negotiated.
+pub(super) fn negotiate_application_settings<'a>(
+    offered: Option<&ClientHelloApplicationSettings>,
+    selected_alpn: Option<&[u8]>,
+    server_settings: Option<&'a [u8]>,
+    early_data_accepted: bool,
+) -> Result<Option<(&'a [u8], ApplicationSettingsReply)>, PeerMisbehaved> {
+    let Some(server_settings) = server_settings else {
+        return Ok(None);
+    };
+    let Some(offered) = offered else {
+        return Err(PeerMisbehaved::UnsolicitedEncryptedExtension);
+    };
+    if early_data_accepted {
+        return Err(PeerMisbehaved::NegotiatedApplicationSettingsWithEarlyData);
+    }
+    let Some(selected_alpn) = selected_alpn else {
+        return Err(PeerMisbehaved::NegotiatedApplicationSettingsWithoutAlpn);
+    };
+    let Some(settings) = offered.settings_for(selected_alpn) else {
+        return Err(PeerMisbehaved::NegotiatedApplicationSettingsForUnofferedProtocol);
+    };
+
+    Ok(Some((
+        server_settings,
+        ApplicationSettingsReply {
+            extension_type: offered.codepoint().extension_type(),
+            settings: settings.to_vec(),
+        },
+    )))
+}
+
 struct ExpectEncryptedExtensions {
     config: Arc<ClientConfig>,
     resuming_session: Option<persist::Tls13ClientSessionValue>,
@@ -786,6 +849,35 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
             &self.config,
             exts.server_certificate_type.as_ref(),
         )?;
+
+        let early_data_accepted = self.resuming_session.is_some()
+            && cx.common.early_traffic
+            && exts.early_data_ack.is_some();
+        let server_application_settings = exts
+            .application_settings
+            .as_ref()
+            .or(exts.application_settings_old.as_ref())
+            .map(|settings| settings.bytes());
+        let application_settings = match negotiate_application_settings(
+            self.hello.application_settings.as_ref(),
+            cx.common
+                .alpn_protocol
+                .as_ref()
+                .map(|protocol| protocol.as_ref()),
+            server_application_settings,
+            early_data_accepted,
+        ) {
+            Ok(Some((server_settings, reply))) => {
+                cx.data.peer_application_settings = Some(server_settings.to_vec());
+                Some(reply)
+            }
+            Ok(None) => None,
+            Err(misbehaved) => {
+                return Err(cx
+                    .common
+                    .send_fatal_alert(AlertDescription::IllegalParameter, misbehaved));
+            }
+        };
 
         let ech_retry_configs = match (cx.data.ech_status, &exts.encrypted_client_hello_ack) {
             // If we didn't offer ECH, or ECH was accepted, but the server sent an ECH encrypted
@@ -862,6 +954,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                     cert_verified,
                     sig_verified,
                     ech_retry_configs,
+                    application_settings,
                 }))
             }
             _ => {
@@ -881,6 +974,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                         transcript: self.transcript,
                         key_schedule: self.key_schedule,
                         ech_retry_configs,
+                        application_settings,
                     })
                 } else {
                     Box::new(ExpectCertificateOrCertReq {
@@ -891,6 +985,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
                         transcript: self.transcript,
                         key_schedule: self.key_schedule,
                         ech_retry_configs,
+                        application_settings,
                     })
                 })
             }
@@ -910,6 +1005,7 @@ struct ExpectCertificateOrCompressedCertificateOrCertReq {
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificateOrCertReq {
@@ -935,6 +1031,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificateOrC
                 client_auth: None,
                 message_already_in_transcript: false,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             MessagePayload::Handshake {
@@ -949,6 +1046,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificateOrC
                 key_schedule: self.key_schedule,
                 client_auth: None,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             MessagePayload::Handshake {
@@ -963,6 +1061,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificateOrC
                 key_schedule: self.key_schedule,
                 offered_cert_compression: true,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             payload => Err(inappropriate_handshake_message(
@@ -991,6 +1090,7 @@ struct ExpectCertificateOrCompressedCertificate {
     key_schedule: KeyScheduleHandshake,
     client_auth: Option<ClientAuthDetails>,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificate {
@@ -1016,6 +1116,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificate {
                 client_auth: self.client_auth,
                 message_already_in_transcript: false,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             MessagePayload::Handshake {
@@ -1030,6 +1131,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCompressedCertificate {
                 key_schedule: self.key_schedule,
                 client_auth: self.client_auth,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             payload => Err(inappropriate_handshake_message(
@@ -1056,6 +1158,7 @@ struct ExpectCertificateOrCertReq {
     transcript: HandshakeHash,
     key_schedule: KeyScheduleHandshake,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateOrCertReq {
@@ -1081,6 +1184,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCertReq {
                 client_auth: None,
                 message_already_in_transcript: false,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             MessagePayload::Handshake {
@@ -1095,6 +1199,7 @@ impl State<ClientConnectionData> for ExpectCertificateOrCertReq {
                 key_schedule: self.key_schedule,
                 offered_cert_compression: false,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
             .handle(cx, m),
             payload => Err(inappropriate_handshake_message(
@@ -1125,6 +1230,7 @@ struct ExpectCertificateRequest {
     key_schedule: KeyScheduleHandshake,
     offered_cert_compression: bool,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateRequest {
@@ -1208,6 +1314,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
                 key_schedule: self.key_schedule,
                 client_auth: Some(client_auth),
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
         } else {
             Box::new(ExpectCertificate {
@@ -1220,6 +1327,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
                 client_auth: Some(client_auth),
                 message_already_in_transcript: false,
                 ech_retry_configs: self.ech_retry_configs,
+                application_settings: self.application_settings,
             })
         })
     }
@@ -1238,6 +1346,7 @@ struct ExpectCompressedCertificate {
     key_schedule: KeyScheduleHandshake,
     client_auth: Option<ClientAuthDetails>,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCompressedCertificate {
@@ -1323,6 +1432,7 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
             client_auth: self.client_auth,
             message_already_in_transcript: true,
             ech_retry_configs: self.ech_retry_configs,
+            application_settings: self.application_settings,
         })
         .handle(cx, m)
     }
@@ -1342,6 +1452,7 @@ struct ExpectCertificate {
     client_auth: Option<ClientAuthDetails>,
     message_already_in_transcript: bool,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificate {
@@ -1388,6 +1499,7 @@ impl State<ClientConnectionData> for ExpectCertificate {
             server_cert,
             client_auth: self.client_auth,
             ech_retry_configs: self.ech_retry_configs,
+            application_settings: self.application_settings,
         }))
     }
 
@@ -1407,6 +1519,7 @@ struct ExpectCertificateVerify<'a> {
     server_cert: ServerCertDetails<'a>,
     client_auth: Option<ClientAuthDetails>,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
@@ -1479,6 +1592,7 @@ impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
             cert_verified,
             sig_verified,
             ech_retry_configs: self.ech_retry_configs,
+            application_settings: self.application_settings,
         }))
     }
 
@@ -1493,6 +1607,7 @@ impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
             server_cert: self.server_cert.into_owned(),
             client_auth: self.client_auth,
             ech_retry_configs: self.ech_retry_configs,
+            application_settings: self.application_settings,
         })
     }
 }
@@ -1586,6 +1701,7 @@ struct ExpectFinished {
     cert_verified: verify::ServerCertVerified,
     sig_verified: verify::HandshakeSignatureValid,
     ech_retry_configs: Option<Vec<EchConfigPayload>>,
+    application_settings: Option<ApplicationSettingsReply>,
 }
 
 impl State<ClientConnectionData> for ExpectFinished {
@@ -1630,6 +1746,13 @@ impl State<ClientConnectionData> for ExpectFinished {
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
+
+        /* ALPS: the client's settings, in an EncryptedExtensions of its own,
+         * first in the flight (draft-vvv-tls-alps section 4): in the
+         * transcript of our Finished, not in that of the traffic secrets. */
+        if let Some(reply) = &st.application_settings {
+            flight.add(reply.encrypted_extensions());
+        }
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */

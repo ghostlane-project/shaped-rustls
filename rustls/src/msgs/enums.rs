@@ -141,6 +141,8 @@ enum_builder! {
         KeyShare => 0x0033,
         TransportParameters => 0x0039,
         NextProtocolNegotiation => 0x3374,
+        ApplicationSettingsOld => 0x4469, // https://datatracker.ietf.org/doc/html/draft-vvv-tls-alps-01, BoringSSL's TLSEXT_TYPE_application_settings_old
+        ApplicationSettings => 0x44cd, // BoringSSL's TLSEXT_TYPE_application_settings
         ChannelId => 0x754f,
         RenegotiationInfo => 0xff01,
         TransportParametersDraft => 0xffa5,

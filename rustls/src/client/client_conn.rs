@@ -794,6 +794,19 @@ mod connection {
             self.inner.core.data.ech_status
         }
 
+        /// The server's ALPS (application_settings) for the negotiated ALPN
+        /// protocol, once the server's EncryptedExtensions is read: `None`
+        /// when ALPS was not negotiated (not offered with
+        /// [`crate::client::ClientHelloApplicationSettings`], or not
+        /// accepted by the server).
+        pub fn peer_application_settings(&self) -> Option<&[u8]> {
+            self.inner
+                .core
+                .data
+                .peer_application_settings
+                .as_deref()
+        }
+
         /// Returns the number of TLS1.3 tickets that have been received.
         pub fn tls13_tickets_received(&self) -> u32 {
             self.inner.tls13_tickets_received
@@ -1065,6 +1078,9 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
+    /// The server's ALPS (application_settings) when the handshake
+    /// negotiated it: at most one extension's worth, 65535 bytes.
+    pub(super) peer_application_settings: Option<Vec<u8>>,
 }
 
 impl ClientConnectionData {
@@ -1072,6 +1088,7 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
+            peer_application_settings: None,
         }
     }
 }

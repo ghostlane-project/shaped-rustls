@@ -603,7 +603,8 @@ pub mod client {
     pub use client_hello::{
         CapturesClientHello, ClientHelloAdvertisedCipherSuites,
         ClientHelloAdvertisedSupportedGroups, ClientHelloAdvertisedSupportedVersions,
-        ClientHelloAlpnProtocols, ClientHelloCertificateCompressionAlgorithms,
+        ClientHelloAlpnProtocols, ClientHelloApplicationProtocol, ClientHelloApplicationSettings,
+        ClientHelloApplicationSettingsCodepoint, ClientHelloCertificateCompressionAlgorithms,
         ClientHelloCipherSuites, ClientHelloContext, ClientHelloCustomizer,
         ClientHelloExactExtension, ClientHelloExactExtensions, ClientHelloExtensionOrder,
         ClientHelloExtensionPlan, ClientHelloExtensionType, ClientHelloForcedExtensions,

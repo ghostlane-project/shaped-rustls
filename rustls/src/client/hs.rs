@@ -517,9 +517,62 @@ fn apply_extension_plan(
             | ExtensionType::NextProtocolNegotiation
             | ExtensionType::ChannelId
             | ExtensionType::Unknown(_) => {}
+            // Never emitted unless the plan offers it, which then refuses a
+            // plan that also disables it.
+            ExtensionType::ApplicationSettings | ExtensionType::ApplicationSettingsOld => {}
         }
     }
 
+    Ok(())
+}
+
+/// Offers the plan's ALPS (application_settings) and keeps what the
+/// handshake needs to answer a server that accepts it.
+///
+/// As BoringSSL's client (`ext_alps_add_clienthello`), ALPS is offered only
+/// when the hello offers TLS 1.3 and ALPN; otherwise it is left out, and a
+/// planned extension order drops it as it drops any extension not emitted.
+fn apply_application_settings_plan(
+    plan: Option<&ClientHelloPlan>,
+    exts: &mut ClientExtensions<'_>,
+    hello: &mut ClientHelloDetails,
+    supported_versions: &SupportedProtocolVersions,
+) -> Result<(), Error> {
+    hello.application_settings = None;
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    let Some(application_settings) = plan.application_settings.as_ref() else {
+        return Ok(());
+    };
+
+    let extension_type = application_settings
+        .codepoint()
+        .extension_type();
+    let disabled = plan
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| {
+            extensions
+                .disabled_extensions()
+                .iter()
+                .any(|disabled| ExtensionType::from(disabled.0) == extension_type)
+        });
+    if disabled {
+        return Err(Error::General(
+            "ClientHello extension plan cannot disable the application_settings it offers".into(),
+        ));
+    }
+    if !supported_versions.tls13 || exts.protocols.is_none() {
+        return Ok(());
+    }
+
+    let body = Some(Payload::new(application_settings.extension_body()));
+    match extension_type {
+        ExtensionType::ApplicationSettingsOld => exts.application_settings_old = body,
+        _ => exts.application_settings = body,
+    }
+    hello.application_settings = Some(application_settings.clone());
     Ok(())
 }
 
@@ -1210,6 +1263,12 @@ fn emit_client_hello_for_retry(
         &supported_versions,
         require_ems,
     )?;
+    apply_application_settings_plan(
+        input.plan.as_ref(),
+        &mut exts,
+        &mut input.hello,
+        &supported_versions,
+    )?;
     apply_forced_extension_plan(input.plan.as_ref(), &mut exts);
     apply_raw_extension_plan(input.plan.as_ref(), &mut exts);
     apply_advertised_supported_versions_plan(input.plan.as_ref(), &mut exts)?;
@@ -1773,6 +1832,20 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         // Extract ALPN protocol
         if !cx.common.is_tls13() {
+            // ALPS is TLS 1.3's, answered in EncryptedExtensions: BoringSSL
+            // refuses it in a TLS 1.2 ServerHello, and so does this.
+            if server_hello
+                .application_settings
+                .is_some()
+                || server_hello
+                    .application_settings_old
+                    .is_some()
+            {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::UnsupportedExtension,
+                    PeerMisbehaved::NegotiatedApplicationSettingsWithOldProtocolVersion,
+                ));
+            }
             process_alpn_protocol(
                 cx.common,
                 &self.input.hello.alpn_protocols,

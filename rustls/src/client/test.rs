@@ -10,8 +10,9 @@ use pki_types::{CertificateDer, ServerName};
 use crate::client::{
     ClientConfig, ClientConnection, ClientHelloAdvertisedCipherSuites,
     ClientHelloAdvertisedSupportedGroups, ClientHelloAdvertisedSupportedVersions,
-    ClientHelloAlpnProtocols, ClientHelloCertificateCompressionAlgorithms, ClientHelloCipherSuites,
-    ClientHelloContext, ClientHelloCustomizer, ClientHelloExactExtension,
+    ClientHelloAlpnProtocols, ClientHelloApplicationProtocol, ClientHelloApplicationSettings,
+    ClientHelloApplicationSettingsCodepoint, ClientHelloCertificateCompressionAlgorithms,
+    ClientHelloCipherSuites, ClientHelloContext, ClientHelloCustomizer, ClientHelloExactExtension,
     ClientHelloExactExtensions, ClientHelloExtensionOrder, ClientHelloExtensionPlan,
     ClientHelloForcedExtensions, ClientHelloGreaseExtension, ClientHelloGreasePlan,
     ClientHelloKeySharePlan, ClientHelloPaddingPlan, ClientHelloPlan, ClientHelloRawExtension,
@@ -45,14 +46,15 @@ mod tests {
     use crate::crypto::cipher::MessageEncrypter;
     use crate::crypto::tls13::OkmBlock;
     use crate::enums::CertificateType;
+    use crate::msgs::base::Payload;
     use crate::msgs::base::PayloadU8;
     use crate::msgs::enums::ECCurveType;
     use crate::msgs::handshake::{
-        CertificateChain, EcParameters, HelloRetryRequestExtensions, KeyShareEntry,
+        CertificateChain, EcParameters, HelloRetryRequestExtensions, KeyShareEntry, ProtocolName,
         ServerEcdhParams, ServerExtensions, ServerKeyExchange, ServerKeyExchangeParams,
-        ServerKeyExchangePayload,
+        ServerKeyExchangePayload, SingleProtocolName,
     };
-    use crate::msgs::message::PlainMessage;
+    use crate::msgs::message::{InboundOpaqueMessage, PlainMessage};
     use crate::pki_types::pem::PemObject;
     use crate::pki_types::{PrivateKeyDer, UnixTime};
     #[cfg(feature = "aws_lc_rs")]
@@ -1401,12 +1403,11 @@ mod tests {
     }
 
     #[test]
-    fn client_hello_oracle_places_raw_alps_with_alpn_compression_and_padding() {
+    fn client_hello_oracle_places_alps_with_alpn_compression_and_padding() {
         static BROTLI_DECOMPRESSOR: TestCertDecompressor =
             TestCertDecompressor(CertificateCompressionAlgorithm::Brotli);
 
-        let alps = ClientHelloRawExtension::new(0x4469, vec![0, 3, b'h', b'2', 0]).unwrap();
-        let raw_extensions = ClientHelloRawExtensions::try_from(vec![alps]).unwrap();
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::Old, vec![]);
         let alpn =
             ClientHelloAlpnProtocols::try_from(vec![b"h2".to_vec(), b"http/1.1".to_vec()]).unwrap();
         let compression = ClientHelloCertificateCompressionAlgorithms::try_from(vec![
@@ -1441,7 +1442,7 @@ mod tests {
                 ClientHelloPlan::new()
                     .with_alpn_protocols(alpn)
                     .with_certificate_compression_algorithms(compression)
-                    .with_raw_extensions(raw_extensions)
+                    .with_application_settings(alps)
                     .with_extension_order(order)
                     .with_padding(padding),
             )),
@@ -1467,7 +1468,7 @@ mod tests {
             ])
             .expect_extension_body(
                 0x4469,
-                ExpectedExtensionBody::Exact(vec![0, 3, b'h', b'2', 0]),
+                ExpectedExtensionBody::Exact(vec![0, 3, 2, b'h', b'2']),
             )
             .expect_extension_body(
                 u16::from(ExtensionType::Padding),
@@ -1528,10 +1529,7 @@ mod tests {
             CertificateCompressionAlgorithm::Brotli,
         ])
         .unwrap();
-        let raw_extensions = ClientHelloRawExtensions::try_from(vec![
-            ClientHelloRawExtension::new(0x4469, vec![0, 3, b'h', b'2', 0]).unwrap(),
-        ])
-        .unwrap();
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::Old, vec![]);
         let forced = ClientHelloForcedExtensions::new()
             .with_renegotiation_info_empty()
             .with_session_ticket_request()
@@ -1583,7 +1581,7 @@ mod tests {
                     .with_signature_algorithms(signature_algorithms)
                     .with_alpn_protocols(alpn)
                     .with_certificate_compression_algorithms(compression)
-                    .with_raw_extensions(raw_extensions)
+                    .with_application_settings(alps)
                     .with_forced_extensions(forced)
                     .with_grease(grease)
                     .with_extension_order(extension_order)
@@ -1639,7 +1637,7 @@ mod tests {
             )
             .expect_extension_body(
                 0x4469,
-                ExpectedExtensionBody::Exact(vec![0, 3, b'h', b'2', 0]),
+                ExpectedExtensionBody::Exact(vec![0, 3, 2, b'h', b'2']),
             )
             .expect_extension_body(0x1a1a, ExpectedExtensionBody::Exact(vec![0]))
             .expect_extension_body(
@@ -1647,6 +1645,743 @@ mod tests {
                 ExpectedExtensionBody::Exact(vec![0; 206]),
             )
             .assert_matches_encoded(&encoded);
+    }
+
+    fn alps_config(application_settings: Option<ClientHelloApplicationSettings>) -> ClientConfig {
+        let mut config = tls13_x25519_config_with_alpn();
+        let plan = match application_settings {
+            Some(application_settings) => {
+                ClientHelloPlan::new().with_application_settings(application_settings)
+            }
+            None => ClientHelloPlan::new(),
+        };
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(plan)),
+        }));
+        config
+    }
+
+    #[test]
+    fn alps_is_offered_at_its_codepoint_for_its_protocols_in_order() {
+        let alps = ClientHelloApplicationSettings::new(
+            ClientHelloApplicationSettingsCodepoint::New,
+            vec![
+                ClientHelloApplicationProtocol::new(b"h2".to_vec(), vec![1]).unwrap(),
+                ClientHelloApplicationProtocol::new(b"http/1.1".to_vec(), vec![]).unwrap(),
+            ],
+        )
+        .unwrap();
+        let encoded = client_hello_encoded_bytes_for_config(alps_config(Some(alps))).unwrap();
+
+        // The protocol names alone, as ALPN's list: the settings are the
+        // client's EncryptedExtensions', not the hello's.
+        let mut expected = vec![0, 12, 2];
+        expected.extend_from_slice(b"h2");
+        expected.push(8);
+        expected.extend_from_slice(b"http/1.1");
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x44cd),
+            Some(expected)
+        );
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x4469),
+            None
+        );
+
+        let old = alps_for_h2(ClientHelloApplicationSettingsCodepoint::Old, vec![1, 2]);
+        let encoded = client_hello_encoded_bytes_for_config(alps_config(Some(old))).unwrap();
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x4469),
+            Some(vec![0, 3, 2, b'h', b'2'])
+        );
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x44cd),
+            None
+        );
+    }
+
+    #[test]
+    fn alps_is_not_offered_without_a_plan_for_it() {
+        let encoded = client_hello_encoded_bytes_for_config(alps_config(None)).unwrap();
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x44cd),
+            None
+        );
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x4469),
+            None
+        );
+    }
+
+    #[test]
+    fn alps_is_left_out_without_alpn_as_boringssl_leaves_it() {
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![]);
+        let mut config = alps_config(Some(alps));
+        config.alpn_protocols.clear();
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x44cd),
+            None
+        );
+    }
+
+    #[test]
+    fn alps_cannot_be_both_offered_and_disabled() {
+        let mut config = tls13_x25519_config_with_alpn();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new()
+                    .with_extensions(ClientHelloExtensionPlan::try_from(vec![0x44cd]).unwrap())
+                    .with_application_settings(alps_for_h2(
+                        ClientHelloApplicationSettingsCodepoint::New,
+                        vec![],
+                    )),
+            )),
+        }));
+        assert_eq!(
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap()).err(),
+            Some(Error::General(
+                "ClientHello extension plan cannot disable the application_settings it offers"
+                    .into()
+            ))
+        );
+    }
+
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn alps_is_left_out_without_tls13_as_boringssl_leaves_it() {
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS12])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_application_settings(
+                alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![]),
+            ))),
+        }));
+        let encoded = client_hello_encoded_bytes_for_config(config).unwrap();
+        assert_eq!(
+            client_hello_extension_body_from_encoded(&encoded, 0x44cd),
+            None
+        );
+    }
+
+    #[test]
+    fn alps_codepoints_are_neither_raw_nor_exact_extensions() {
+        for codepoint in [0x4469, 0x44cd] {
+            assert!(ClientHelloRawExtension::new(codepoint, vec![0, 3, 2, b'h', b'2']).is_err());
+            assert!(ClientHelloExactExtension::new(codepoint, vec![0, 3, 2, b'h', b'2']).is_err());
+        }
+    }
+
+    #[test]
+    fn alps_settings_are_bounded_and_named() {
+        let new = ClientHelloApplicationSettingsCodepoint::New;
+        assert_eq!(new.value(), 0x44cd);
+        assert_eq!(ClientHelloApplicationSettingsCodepoint::Old.value(), 0x4469);
+        assert!(ClientHelloApplicationSettings::new(new, vec![]).is_err());
+        let h2 = ClientHelloApplicationProtocol::new(b"h2".to_vec(), vec![]).unwrap();
+        assert!(ClientHelloApplicationSettings::new(new, vec![h2.clone(), h2]).is_err());
+        assert!(ClientHelloApplicationProtocol::new(vec![], vec![]).is_err());
+        assert!(ClientHelloApplicationProtocol::new(vec![b'a'; 256], vec![]).is_err());
+        assert!(ClientHelloApplicationProtocol::new(vec![b'a'; 255], vec![]).is_ok());
+        assert!(ClientHelloApplicationProtocol::new(b"h2".to_vec(), vec![0; 65536]).is_err());
+        assert!(ClientHelloApplicationProtocol::new(b"h2".to_vec(), vec![0; 65535]).is_ok());
+    }
+
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn a_tls12_server_hello_with_alps_is_refused() {
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13, &version::TLS12])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(ClientHelloPlan::new().with_application_settings(
+                alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![]),
+            ))),
+        }));
+        let mut conn =
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+        conn.write_tls(&mut Vec::new()).unwrap();
+
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_2,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0u8; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        extended_master_secret_ack: Some(()),
+                        application_settings: Some(Payload::new(vec![])),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        };
+        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+            .unwrap();
+        assert_eq!(
+            conn.process_new_packets().unwrap_err(),
+            PeerMisbehaved::NegotiatedApplicationSettingsWithOldProtocolVersion.into()
+        );
+    }
+
+    #[test]
+    fn a_tls13_server_hello_with_alps_is_refused() {
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![]);
+        let mut conn = ClientConnection::new(
+            alps_config(Some(alps)).into(),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        conn.write_tls(&mut Vec::new()).unwrap();
+
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_3,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        key_share: Some(KeyShareEntry {
+                            group: NamedGroup::X25519,
+                            payload: PayloadU16::new(vec![0xaa; 32]),
+                        }),
+                        application_settings: Some(Payload::new(vec![])),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        };
+        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+            .unwrap();
+        assert_eq!(
+            conn.process_new_packets().unwrap_err(),
+            PeerMisbehaved::UnexpectedCleartextExtension.into()
+        );
+    }
+
+    /// A client of `alps_config(application_settings)` reads a ServerHello
+    /// and then `encrypted_extensions`, sent as the server would: the
+    /// result, and the server's ALPS as the connection then reports it.
+    fn client_with_alps_receives_server_ee(
+        application_settings: Option<ClientHelloApplicationSettings>,
+        encrypted_extensions: ServerExtensions<'_>,
+    ) -> (Result<(), Error>, Option<Vec<u8>>) {
+        let fake_server_crypto = Arc::new(FakeServerCrypto::new());
+        let mut config = alps_config(application_settings);
+        config.key_log = fake_server_crypto.clone();
+        let mut conn =
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+        conn.write_tls(&mut Vec::new()).unwrap();
+
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_3,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        key_share: Some(KeyShareEntry {
+                            group: NamedGroup::X25519,
+                            payload: PayloadU16::new(vec![0xaa; 32]),
+                        }),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        };
+        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+            .unwrap();
+        conn.process_new_packets().unwrap();
+
+        let ee = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::EncryptedExtensions(Box::new(encrypted_extensions)),
+            )),
+        };
+        let mut encrypter = fake_server_crypto.server_handshake_encrypter();
+        let enc_ee = encrypter
+            .encrypt(PlainMessage::from(ee).borrow_outbound(), 0)
+            .unwrap();
+        conn.read_tls(&mut enc_ee.encode().as_slice())
+            .unwrap();
+        let result = conn.process_new_packets().map(|_| ());
+        let settings = conn
+            .peer_application_settings()
+            .map(<[u8]>::to_vec);
+        (result, settings)
+    }
+
+    fn server_ee_with_alps(
+        alpn: Option<&[u8]>,
+        new: Option<Vec<u8>>,
+        old: Option<Vec<u8>>,
+    ) -> ServerExtensions<'static> {
+        ServerExtensions {
+            selected_protocol: alpn
+                .map(|alpn| SingleProtocolName::new(ProtocolName::from(alpn.to_vec()))),
+            application_settings: new.map(Payload::new),
+            application_settings_old: old.map(Payload::new),
+            ..ServerExtensions::default()
+        }
+    }
+
+    #[test]
+    fn a_server_that_accepts_alps_for_the_selected_protocol_is_read() {
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![9]);
+        assert_eq!(
+            client_with_alps_receives_server_ee(
+                Some(alps.clone()),
+                server_ee_with_alps(Some(&b"h2"[..]), Some(vec![1, 2, 3]), None),
+            ),
+            (Ok(()), Some(vec![1, 2, 3]))
+        );
+        // Empty settings are settings: ALPS is negotiated all the same.
+        assert_eq!(
+            client_with_alps_receives_server_ee(
+                Some(alps),
+                server_ee_with_alps(Some(&b"h2"[..]), Some(vec![]), None),
+            ),
+            (Ok(()), Some(vec![]))
+        );
+        let old = alps_for_h2(ClientHelloApplicationSettingsCodepoint::Old, vec![]);
+        assert_eq!(
+            client_with_alps_receives_server_ee(
+                Some(old),
+                server_ee_with_alps(Some(&b"h2"[..]), None, Some(vec![7])),
+            ),
+            (Ok(()), Some(vec![7]))
+        );
+    }
+
+    #[test]
+    fn a_server_that_ignores_alps_negotiates_none() {
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![9]);
+        assert_eq!(
+            client_with_alps_receives_server_ee(
+                Some(alps),
+                server_ee_with_alps(Some(&b"h2"[..]), None, None),
+            ),
+            (Ok(()), None)
+        );
+    }
+
+    #[test]
+    fn a_server_alps_out_of_line_with_the_offer_is_refused() {
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![9]);
+        let refused = |offer: Option<ClientHelloApplicationSettings>, ee, why: PeerMisbehaved| {
+            assert_eq!(
+                client_with_alps_receives_server_ee(offer, ee),
+                (Err(why.into()), None)
+            );
+        };
+        // Without ALPN.
+        refused(
+            Some(alps.clone()),
+            server_ee_with_alps(None, Some(vec![1]), None),
+            PeerMisbehaved::NegotiatedApplicationSettingsWithoutAlpn,
+        );
+        // For a protocol offered by ALPN, not by ALPS.
+        refused(
+            Some(alps.clone()),
+            server_ee_with_alps(Some(&b"http/1.1"[..]), Some(vec![1]), None),
+            PeerMisbehaved::NegotiatedApplicationSettingsForUnofferedProtocol,
+        );
+        // At the codepoint not offered.
+        refused(
+            Some(alps.clone()),
+            server_ee_with_alps(Some(&b"h2"[..]), None, Some(vec![1])),
+            PeerMisbehaved::UnsolicitedEncryptedExtension,
+        );
+        // Not offered at all.
+        refused(
+            None,
+            server_ee_with_alps(Some(&b"h2"[..]), Some(vec![1]), None),
+            PeerMisbehaved::UnsolicitedEncryptedExtension,
+        );
+    }
+
+    #[test]
+    fn alps_with_accepted_early_data_is_refused() {
+        let alps = alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![]);
+        assert_eq!(
+            crate::client::tls13::negotiate_application_settings(
+                Some(&alps),
+                Some(&b"h2"[..]),
+                Some(&[1u8][..]),
+                true,
+            ),
+            Err(PeerMisbehaved::NegotiatedApplicationSettingsWithEarlyData)
+        );
+        assert_eq!(
+            crate::client::tls13::negotiate_application_settings(
+                Some(&alps),
+                Some(&b"h2"[..]),
+                None,
+                true,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn the_client_alps_is_an_encrypted_extensions_of_its_own() {
+        use crate::client::tls13::negotiate_application_settings;
+
+        let encoding = |codepoint, settings: Vec<u8>| {
+            let alps = alps_for_h2(codepoint, settings);
+            let (_, reply) =
+                negotiate_application_settings(Some(&alps), Some(&b"h2"[..]), Some(&[][..]), false)
+                    .unwrap()
+                    .unwrap();
+            reply
+                .encrypted_extensions()
+                .get_encoding()
+        };
+        // type 8 (EncryptedExtensions), u24 length; the extensions' u16
+        // length; one extension: ALPS, u16 length, the client's settings.
+        assert_eq!(
+            encoding(ClientHelloApplicationSettingsCodepoint::New, vec![1, 2, 3]),
+            vec![8, 0, 0, 9, 0, 7, 0x44, 0xcd, 0, 3, 1, 2, 3]
+        );
+        assert_eq!(
+            encoding(ClientHelloApplicationSettingsCodepoint::Old, vec![]),
+            vec![8, 0, 0, 6, 0, 4, 0x44, 0x69, 0, 0]
+        );
+    }
+
+    /// The handshake secrets the client logs, as the server holds them.
+    #[derive(Debug, Default)]
+    struct HandshakeSecrets {
+        client: OnceLock<Vec<u8>>,
+        server: OnceLock<Vec<u8>>,
+    }
+
+    impl KeyLog for HandshakeSecrets {
+        fn will_log(&self, _label: &str) -> bool {
+            true
+        }
+
+        fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+            let slot = match label {
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => &self.client,
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET" => &self.server,
+                _ => return,
+            };
+            slot.set(secret.to_vec()).unwrap();
+        }
+    }
+
+    /// Takes any certificate and any signature: the server of
+    /// `client_flight_after_server_finished` signs nothing.
+    #[derive(Debug)]
+    struct AcceptsAnyServer;
+
+    impl ServerCertVerifier for AcceptsAnyServer {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        #[cfg_attr(coverage_nightly, coverage(off))]
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            unreachable!()
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::ED25519]
+        }
+    }
+
+    fn handshake_message(typ: u8, body: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(body.len())
+            .unwrap()
+            .to_be_bytes();
+        let mut message = vec![typ, len[1], len[2], len[3]];
+        message.extend_from_slice(body);
+        message
+    }
+
+    /// HMAC(finished_key(`secret`), Hash(`transcript`)): a Finished's
+    /// verify_data (RFC 8446 section 4.4.4).
+    fn finished_verify_data(secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+        let suite = super::provider::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .unwrap();
+        let expander = suite
+            .hkdf_provider
+            .expander_for_okm(&OkmBlock::new(secret));
+        let key = crate::tls13::key_schedule::hkdf_expand_label_block(
+            expander.as_ref(),
+            b"finished",
+            &[],
+        );
+        let hash = suite
+            .common
+            .hash_provider
+            .hash(transcript);
+        suite
+            .hkdf_provider
+            .hmac_sign(&key, hash.as_ref())
+            .as_ref()
+            .to_vec()
+    }
+
+    /// What the client sent after the server's Finished.
+    struct ClientFlight {
+        /// The handshake transcript through the server's Finished.
+        transcript: Vec<u8>,
+        /// The client's handshake messages, decrypted: type and body.
+        messages: Vec<(u8, Vec<u8>)>,
+        /// The client's handshake traffic secret.
+        client_secret: Vec<u8>,
+    }
+
+    /// A client offering `application_settings` runs a TLS 1.3 handshake to
+    /// the server's Finished against a server made here, which answers
+    /// `encrypted_extensions`.
+    fn client_flight_after_server_finished(
+        application_settings: ClientHelloApplicationSettings,
+        encrypted_extensions: ServerExtensions<'_>,
+    ) -> ClientFlight {
+        let suite = super::provider::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .unwrap();
+        let secrets = Arc::new(HandshakeSecrets::default());
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptsAnyServer))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_application_settings(application_settings),
+            )),
+        }));
+        config.key_log = secrets.clone();
+        let mut conn =
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+
+        let mut hello = Vec::new();
+        conn.write_tls(&mut hello).unwrap();
+        assert_eq!(
+            usize::from(u16::from_be_bytes([hello[3], hello[4]])) + 5,
+            hello.len(),
+            "the ClientHello is one record"
+        );
+        let mut transcript = hello[5..].to_vec();
+
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_3,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        key_share: Some(KeyShareEntry {
+                            group: NamedGroup::X25519,
+                            payload: PayloadU16::new(vec![0xaa; 32]),
+                        }),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        }
+        .into_wire_bytes();
+        transcript.extend_from_slice(&sh[5..]);
+        conn.read_tls(&mut sh.as_slice())
+            .unwrap();
+        conn.process_new_packets().unwrap();
+
+        let server_secret = secrets.server.get().unwrap().clone();
+        let client_secret = secrets.client.get().unwrap().clone();
+        let keys = |secret: &[u8]| {
+            let expander = suite
+                .hkdf_provider
+                .expander_for_okm(&OkmBlock::new(secret));
+            (
+                derive_traffic_key(expander.as_ref(), suite.aead_alg),
+                derive_traffic_iv(expander.as_ref()),
+            )
+        };
+
+        let mut flight = vec![
+            HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(Box::new(
+                encrypted_extensions,
+            )))
+            .get_encoding(),
+            // Certificate: no context, one entry of two bytes, no extensions.
+            handshake_message(11, &[0, 0, 0, 7, 0, 0, 2, 0x30, 0x00, 0, 0]),
+            // CertificateVerify: ed25519, a one-byte signature.
+            handshake_message(15, &[0x08, 0x07, 0, 1, 0]),
+        ];
+        for message in &flight {
+            transcript.extend_from_slice(message);
+        }
+        let finished = handshake_message(20, &finished_verify_data(&server_secret, &transcript));
+        transcript.extend_from_slice(&finished);
+        flight.push(finished);
+
+        let (key, iv) = keys(&server_secret);
+        let mut encrypter = suite.aead_alg.encrypter(key, iv);
+        for (seq, message) in flight.into_iter().enumerate() {
+            let record = encrypter
+                .encrypt(
+                    PlainMessage {
+                        typ: ContentType::Handshake,
+                        version: ProtocolVersion::TLSv1_3,
+                        payload: Payload::new(message),
+                    }
+                    .borrow_outbound(),
+                    seq as u64,
+                )
+                .unwrap()
+                .encode();
+            conn.read_tls(&mut record.as_slice())
+                .unwrap();
+        }
+        conn.process_new_packets().unwrap();
+
+        let mut out = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut out).unwrap();
+        }
+        let (key, iv) = keys(&client_secret);
+        let mut decrypter = suite.aead_alg.decrypter(key, iv);
+        let mut plain = Vec::new();
+        let (mut at, mut seq) = (0, 0);
+        while at < out.len() {
+            let len = usize::from(u16::from_be_bytes([out[at + 3], out[at + 4]]));
+            let typ = ContentType::from(out[at]);
+            let mut body = out[at + 5..at + 5 + len].to_vec();
+            at += 5 + len;
+            if typ == ContentType::ChangeCipherSpec {
+                continue;
+            }
+            assert_eq!(typ, ContentType::ApplicationData);
+            let message = decrypter
+                .decrypt(
+                    InboundOpaqueMessage::new(typ, ProtocolVersion::TLSv1_2, &mut body),
+                    seq,
+                )
+                .unwrap();
+            seq += 1;
+            assert_eq!(message.typ, ContentType::Handshake);
+            plain.extend_from_slice(message.payload);
+        }
+        let mut messages = Vec::new();
+        let mut rest = plain.as_slice();
+        while !rest.is_empty() {
+            let len = usize::from(rest[1]) << 16 | usize::from(rest[2]) << 8 | usize::from(rest[3]);
+            messages.push((rest[0], rest[4..4 + len].to_vec()));
+            rest = &rest[4 + len..];
+        }
+        ClientFlight {
+            transcript,
+            messages,
+            client_secret,
+        }
+    }
+
+    #[test]
+    fn a_client_that_negotiated_alps_sends_its_settings_before_its_finished() {
+        for (codepoint, settings) in [
+            (ClientHelloApplicationSettingsCodepoint::New, vec![]),
+            (ClientHelloApplicationSettingsCodepoint::New, vec![9, 8]),
+            (ClientHelloApplicationSettingsCodepoint::Old, vec![]),
+        ] {
+            let ee = match codepoint {
+                ClientHelloApplicationSettingsCodepoint::New => {
+                    server_ee_with_alps(Some(&b"h2"[..]), Some(vec![1, 2, 3]), None)
+                }
+                ClientHelloApplicationSettingsCodepoint::Old => {
+                    server_ee_with_alps(Some(&b"h2"[..]), None, Some(vec![1, 2, 3]))
+                }
+            };
+            let ClientFlight {
+                transcript,
+                messages,
+                client_secret,
+            } = client_flight_after_server_finished(alps_for_h2(codepoint, settings.clone()), ee);
+
+            let mut alps = codepoint.value().to_be_bytes().to_vec();
+            alps.extend_from_slice(&(settings.len() as u16).to_be_bytes());
+            alps.extend_from_slice(&settings);
+            let mut client_ee = (alps.len() as u16)
+                .to_be_bytes()
+                .to_vec();
+            client_ee.extend_from_slice(&alps);
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_eq!(messages[0], (8, client_ee.clone()));
+
+            // The client's Finished covers its EncryptedExtensions.
+            let mut through_ee = transcript.clone();
+            through_ee.extend_from_slice(&handshake_message(8, &client_ee));
+            assert_eq!(
+                messages[1],
+                (20, finished_verify_data(&client_secret, &through_ee))
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_whose_alps_the_server_ignored_sends_its_finished_alone() {
+        let ClientFlight {
+            transcript,
+            messages,
+            client_secret,
+        } = client_flight_after_server_finished(
+            alps_for_h2(ClientHelloApplicationSettingsCodepoint::New, vec![]),
+            server_ee_with_alps(Some(&b"h2"[..]), None, None),
+        );
+        assert_eq!(
+            messages,
+            vec![(20, finished_verify_data(&client_secret, &transcript))]
+        );
     }
 
     #[test]
@@ -3777,6 +4512,18 @@ fn boringssl_padding_follows_each_client_hellos_own_length() {
 #[derive(Debug)]
 struct StaticClientHelloCustomizer {
     plan: Mutex<Option<ClientHelloPlan>>,
+}
+
+/// ALPS for `h2` alone at `codepoint`, with `settings` as the client's.
+fn alps_for_h2(
+    codepoint: ClientHelloApplicationSettingsCodepoint,
+    settings: Vec<u8>,
+) -> ClientHelloApplicationSettings {
+    ClientHelloApplicationSettings::new(
+        codepoint,
+        vec![ClientHelloApplicationProtocol::new(b"h2".to_vec(), settings).unwrap()],
+    )
+    .unwrap()
 }
 
 impl ClientHelloCustomizer for StaticClientHelloCustomizer {

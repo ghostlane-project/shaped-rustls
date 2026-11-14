@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::ResolvesClientCert;
+use super::client_hello::ClientHelloApplicationSettings;
 use crate::log::{debug, trace};
 use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
@@ -39,6 +40,9 @@ pub(super) struct ClientHelloDetails {
     pub(super) sent_extensions: Vec<ExtensionType>,
     pub(super) extension_order_seed: u16,
     pub(super) offered_cert_compression: bool,
+    /// The ALPS this hello offered, with the client's settings to answer a
+    /// server that accepts it.
+    pub(super) application_settings: Option<ClientHelloApplicationSettings>,
 }
 
 impl ClientHelloDetails {
@@ -48,6 +52,7 @@ impl ClientHelloDetails {
             sent_extensions: Vec::new(),
             extension_order_seed,
             offered_cert_compression: false,
+            application_settings: None,
         }
     }
 

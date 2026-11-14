@@ -1015,6 +1015,15 @@ extension_struct! {
         ExtensionType::TransportParametersDraft =>
             pub(crate) transport_parameters_draft: Option<Payload<'a>>,
 
+        /// ALPS offer at the draft's codepoint (draft-vvv-tls-alps): the
+        /// protocol list, kept as its bytes (a server does not read it)
+        ExtensionType::ApplicationSettingsOld =>
+            pub(crate) application_settings_old: Option<Payload<'a>>,
+
+        /// ALPS offer at BoringSSL's newer codepoint, as the draft's
+        ExtensionType::ApplicationSettings =>
+            pub(crate) application_settings: Option<Payload<'a>>,
+
         /// Encrypted inner client hello (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello: Option<EncryptedClientHello>,
@@ -1089,6 +1098,8 @@ impl ClientExtensions<'_> {
             transport_parameters,
             renegotiation_info,
             transport_parameters_draft,
+            application_settings_old,
+            application_settings,
             encrypted_client_hello,
             encrypted_client_hello_outer,
             order_seed,
@@ -1122,6 +1133,8 @@ impl ClientExtensions<'_> {
             transport_parameters: transport_parameters.map(|x| x.into_owned()),
             renegotiation_info,
             transport_parameters_draft: transport_parameters_draft.map(|x| x.into_owned()),
+            application_settings_old: application_settings_old.map(|x| x.into_owned()),
+            application_settings: application_settings.map(|x| x.into_owned()),
             encrypted_client_hello,
             encrypted_client_hello_outer,
             order_seed,
@@ -1450,6 +1463,15 @@ extension_struct! {
         /// Encrypted inner client hello response (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello_ack: Option<ServerEncryptedClientHello>,
+
+        /// ALPS settings at the draft's codepoint (draft-vvv-tls-alps): the
+        /// server's in its EncryptedExtensions, or the client's in its own
+        ExtensionType::ApplicationSettingsOld =>
+            pub(crate) application_settings_old: Option<Payload<'a>>,
+
+        /// ALPS settings at BoringSSL's newer codepoint, as the draft's
+        ExtensionType::ApplicationSettings =>
+            pub(crate) application_settings: Option<Payload<'a>>,
     } + {
         pub(crate) unknown_extensions: BTreeSet<u16>,
     }
@@ -1474,6 +1496,8 @@ impl ServerExtensions<'_> {
             transport_parameters_draft,
             early_data_ack,
             encrypted_client_hello_ack,
+            application_settings_old,
+            application_settings,
             unknown_extensions,
         } = self;
         ServerExtensions {
@@ -1493,6 +1517,8 @@ impl ServerExtensions<'_> {
             transport_parameters_draft: transport_parameters_draft.map(|x| x.into_owned()),
             early_data_ack,
             encrypted_client_hello_ack,
+            application_settings_old: application_settings_old.map(|x| x.into_owned()),
+            application_settings: application_settings.map(|x| x.into_owned()),
             unknown_extensions,
         }
     }

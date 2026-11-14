@@ -95,6 +95,7 @@ See also: [Go's position on such an API][golang].
 [alps]: https://datatracker.ietf.org/doc/html/draft-vvv-tls-alps
 [golang]: https://github.com/golang/go/issues/51497
 [tlswg]: https://datatracker.ietf.org/wg/tls/charter/
-[^3]: rustls does not currently implement ALPS, but it is something we
-  would consider once standardised and deployed.
+[^3]: upstream rustls does not currently implement ALPS, but it is something
+  they would consider once standardised and deployed. This fork implements its
+  client side, for ClientHello shaping: `ClientHelloApplicationSettings`.
 */
