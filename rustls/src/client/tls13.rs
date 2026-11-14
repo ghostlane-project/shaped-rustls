@@ -372,7 +372,7 @@ pub(super) fn initial_key_shares(
     let planned_group = match plan.and_then(|plan| plan.supported_groups.as_ref()) {
         Some(groups) => {
             let mut selected = None;
-            for group_name in groups.as_slice() {
+            if let Some(group_name) = groups.as_slice().first() {
                 let Some(group) = config.find_kx_group(*group_name, ProtocolVersion::TLSv1_3)
                 else {
                     return Err(Error::General(
@@ -380,7 +380,6 @@ pub(super) fn initial_key_shares(
                     ));
                 };
                 selected = Some(group);
-                break;
             }
             selected
         }

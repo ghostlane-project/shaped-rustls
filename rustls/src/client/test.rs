@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc as StdArc, Mutex};
+use std::sync::Mutex;
 
 use pki_types::{CertificateDer, ServerName};
 
@@ -33,6 +33,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload, OutboundOpaqueMessage};
 use crate::sync::Arc;
+use crate::sync::Arc as StdArc;
 use crate::{Error, PeerIncompatible, PeerMisbehaved, RootCertStore};
 
 #[macro_rules_attribute::apply(test_for_each_provider)]
@@ -2286,9 +2287,11 @@ mod tests {
 
     #[test]
     fn client_extensions_custom_order_rejects_missing_emitted_extension() {
-        let mut extensions = ClientExtensions::default();
-        extensions.extended_master_secret_request = Some(());
-        extensions.ec_point_formats = Some(SupportedEcPointFormats::default());
+        let mut extensions = ClientExtensions {
+            extended_master_secret_request: Some(()),
+            ec_point_formats: Some(SupportedEcPointFormats::default()),
+            ..ClientExtensions::default()
+        };
 
         assert!(
             extensions
@@ -2299,8 +2302,10 @@ mod tests {
 
     #[test]
     fn client_extensions_custom_order_rejects_extra_non_emitted_extension() {
-        let mut extensions = ClientExtensions::default();
-        extensions.extended_master_secret_request = Some(());
+        let mut extensions = ClientExtensions {
+            extended_master_secret_request: Some(()),
+            ..ClientExtensions::default()
+        };
 
         assert!(
             extensions
@@ -2314,8 +2319,10 @@ mod tests {
 
     #[test]
     fn client_extensions_custom_order_rejects_duplicate_extension() {
-        let mut extensions = ClientExtensions::default();
-        extensions.extended_master_secret_request = Some(());
+        let mut extensions = ClientExtensions {
+            extended_master_secret_request: Some(()),
+            ..ClientExtensions::default()
+        };
 
         assert!(
             extensions
@@ -2329,9 +2336,11 @@ mod tests {
 
     #[test]
     fn client_extensions_custom_order_rejects_forced_final_extension() {
-        let mut extensions = ClientExtensions::default();
-        extensions.extended_master_secret_request = Some(());
-        extensions.encrypted_client_hello = Some(EncryptedClientHello::Inner);
+        let mut extensions = ClientExtensions {
+            extended_master_secret_request: Some(()),
+            encrypted_client_hello: Some(EncryptedClientHello::Inner),
+            ..ClientExtensions::default()
+        };
 
         assert!(
             extensions
@@ -2345,9 +2354,11 @@ mod tests {
 
     #[test]
     fn client_extensions_custom_order_rejects_contiguous_extension_and_appends_it_once() {
-        let mut extensions = ClientExtensions::default();
-        extensions.extended_master_secret_request = Some(());
-        extensions.ec_point_formats = Some(SupportedEcPointFormats::default());
+        let mut extensions = ClientExtensions {
+            extended_master_secret_request: Some(()),
+            ec_point_formats: Some(SupportedEcPointFormats::default()),
+            ..ClientExtensions::default()
+        };
         extensions
             .contiguous_extensions
             .push(ExtensionType::ECPointFormats);
