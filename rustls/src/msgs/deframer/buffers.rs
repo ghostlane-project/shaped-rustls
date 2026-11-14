@@ -185,6 +185,11 @@ impl DeframerVecBuffer {
             self.used -= taken;
         } else if taken >= self.used {
             self.used = 0;
+            // Unlike upstream, which shrinks an empty buffer to 4k only at the next `read()`, give
+            // the allocation back as soon as nothing is buffered: a connection that reads no more
+            // (an idle one, or one whose reads now bypass rustls) would otherwise keep a full
+            // record's buffer, 18 KB, for good. The next read starts from a small buffer again.
+            self.buf = Vec::new();
         }
     }
 
@@ -243,22 +248,22 @@ impl DeframerVecBuffer {
             return Err("message buffer full");
         }
 
-        // Grow the buffer to the full window up front for application data so
-        // each socket read can pull a whole record (plus change) in one call;
-        // handshake buffering keeps the incremental 4k sizing to bound memory.
-        // Unlike upstream, do not shrink an empty buffer back down: in steady
-        // state the buffer empties after every processed record batch, and the
-        // shrink-regrow cycle costs a realloc plus zeroing per batch. After
-        // dealing with a large handshake message (exceeding
-        // `OutboundOpaqueMessage::MAX_WIRE_SIZE`), reduce the buffer size
-        // again (large messages should be rare).
-        let need_capacity = match is_joining_hs {
+        // If we can and need to increase the buffer size to allow a 4k read, do so. After
+        // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
+        // make sure to reduce the buffer size again (large messages should be rare).
+        // Also, reduce the buffer size if there are neither full nor partial messages in it,
+        // which usually means that the other side suspended sending data.
+        //
+        // Unlike upstream, once part of an application-data record is buffered, grow straight to
+        // the full window, so the rest of a 16k record (and the start of the next) comes in one
+        // read rather than four 4k ones. Handshake buffering keeps the 4k steps to bound memory.
+        let need_capacity = match is_joining_hs || self.used == 0 {
             true => Ord::min(allow_max, self.used + READ_SIZE),
             false => allow_max,
         };
         if need_capacity > self.buf.len() {
             self.buf.resize(need_capacity, 0);
-        } else if self.buf.len() > allow_max {
+        } else if self.used == 0 || self.buf.len() > allow_max {
             self.buf.resize(need_capacity, 0);
             self.buf.shrink_to(need_capacity);
         }
