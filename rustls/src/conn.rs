@@ -24,6 +24,9 @@ use crate::vecbuf::ChunkVecBuffer;
 pub mod kernel;
 pub(crate) mod unbuffered;
 
+#[cfg(all(test, feature = "std"))]
+mod deframer_test;
+
 #[cfg(feature = "std")]
 mod connection {
     use alloc::vec::Vec;

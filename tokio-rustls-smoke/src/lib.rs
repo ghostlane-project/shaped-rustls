@@ -52,8 +52,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn tokio_rustls_connector_uses_local_rustls_fork() -> io::Result<()> {
+    fn endpoints() -> (TlsAcceptor, TlsConnector) {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_chain = vec![CertificateDer::from(cert.der().to_vec())];
@@ -69,8 +68,21 @@ mod tests {
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
             .with_no_client_auth();
 
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let connector = TlsConnector::from(Arc::new(client_config));
+        (
+            TlsAcceptor::from(Arc::new(server_config)),
+            TlsConnector::from(Arc::new(client_config)),
+        )
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i % 251) as u8)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tokio_rustls_connector_uses_local_rustls_fork() -> io::Result<()> {
+        let (acceptor, connector) = endpoints();
         let (client_io, server_io) = tokio::io::duplex(4096);
 
         let server = tokio::spawn(async move {
@@ -98,6 +110,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&response, b"pong");
+
+        server.await.unwrap();
+        Ok(())
+    }
+
+    /// Full-size records through a pipe narrower than one record: every
+    /// record reaches rustls in many reads, and its deframer buffer empties
+    /// and is released between records.
+    #[tokio::test]
+    async fn tokio_rustls_reads_full_records_split_across_reads() -> io::Result<()> {
+        let (acceptor, connector) = endpoints();
+        let (client_io, server_io) = tokio::io::duplex(1_000);
+        let up = pattern(256 * 1024);
+        let down = pattern(1024 * 1024);
+
+        let server = tokio::spawn({
+            let (up, down) = (up.clone(), down.clone());
+            async move {
+                let mut stream = acceptor
+                    .accept(server_io)
+                    .await
+                    .unwrap();
+                let mut received = vec![0u8; up.len()];
+                stream
+                    .read_exact(&mut received)
+                    .await
+                    .unwrap();
+                assert!(received == up, "the server read other bytes than were sent");
+                stream.write_all(&down).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let mut client = connector
+            .connect(ServerName::try_from("localhost").unwrap(), client_io)
+            .await
+            .unwrap();
+        client.write_all(&up).await.unwrap();
+        client.flush().await.unwrap();
+        let mut received = vec![0u8; down.len()];
+        client
+            .read_exact(&mut received)
+            .await
+            .unwrap();
+        assert!(
+            received == down,
+            "the client read other bytes than were sent"
+        );
 
         server.await.unwrap();
         Ok(())
