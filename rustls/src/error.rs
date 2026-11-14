@@ -8,7 +8,7 @@ use std::time::SystemTimeError;
 use pki_types::{AlgorithmIdentifier, ServerName, UnixTime};
 use webpki::KeyUsage;
 
-use crate::enums::{AlertDescription, ContentType, HandshakeType};
+use crate::enums::{AlertDescription, CipherSuite, ContentType, HandshakeType};
 use crate::msgs::handshake::{EchConfigPayload, KeyExchangeAlgorithm};
 use crate::rand;
 
@@ -350,6 +350,10 @@ pub enum PeerIncompatible {
     UncompressedEcPointsRequired,
     UnsolicitedCertificateTypeExtension,
     ServerRejectedEncryptedClientHello(Option<Vec<EchConfigPayload>>),
+    /// The server chose a cipher suite the ClientHello offered only to look
+    /// like another client (`ClientHelloAdvertisedCipherSuites`): one the
+    /// configured crypto provider does not implement.
+    ServerChoseAdvertisedOnlyCipherSuite(CipherSuite),
 }
 
 impl From<PeerIncompatible> for Error {

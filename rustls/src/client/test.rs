@@ -545,9 +545,68 @@ mod tests {
         conn.read_tls(&mut sh.into_wire_bytes().as_slice())
             .unwrap();
 
+        // The suite was offered, so the server did nothing wrong: the error
+        // says that this client cannot speak the suite it advertised.
         assert_eq!(
             conn.process_new_packets().unwrap_err(),
-            PeerMisbehaved::SelectedUnofferedCipherSuite.into()
+            PeerIncompatible::ServerChoseAdvertisedOnlyCipherSuite(
+                CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256
+            )
+            .into()
+        );
+    }
+
+    /// A TLS 1.3 ServerHello naming a TLS-1.2-only suite the hello advertised
+    /// fails the same way, before its key share is looked at.
+    #[test]
+    fn client_rejects_advertise_only_cipher_suite_in_a_tls13_server_hello() {
+        let cipher_suites = ClientHelloAdvertisedCipherSuites::try_from(vec![
+            CipherSuite::TLS13_AES_128_GCM_SHA256,
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+        ])
+        .unwrap();
+        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+            .with_protocol_versions(&[&version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_customizer = Some(StdArc::new(StaticClientHelloCustomizer {
+            plan: Mutex::new(Some(
+                ClientHelloPlan::new().with_advertised_cipher_suites(cipher_suites),
+            )),
+        }));
+
+        let mut conn =
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+        let mut sent = Vec::new();
+        conn.write_tls(&mut sent).unwrap();
+
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_2,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random([0u8; 32]),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions {
+                        selected_version: Some(ProtocolVersion::TLSv1_3),
+                        ..ServerExtensions::default()
+                    }),
+                }),
+            )),
+        };
+        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+            .unwrap();
+
+        assert_eq!(
+            conn.process_new_packets().unwrap_err(),
+            PeerIncompatible::ServerChoseAdvertisedOnlyCipherSuite(
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+            )
+            .into()
         );
     }
 

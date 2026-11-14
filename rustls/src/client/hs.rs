@@ -1809,12 +1809,16 @@ impl State<ClientConnectionData> for ExpectServerHello {
             });
         }
 
+        // Offered, as checked above, yet not implemented: a suite the plan
+        // advertised only to look like another client.
         let suite = config
             .find_cipher_suite(server_hello.cipher_suite)
             .ok_or_else(|| {
                 cx.common.send_fatal_alert(
                     AlertDescription::HandshakeFailure,
-                    PeerMisbehaved::SelectedUnofferedCipherSuite,
+                    PeerIncompatible::ServerChoseAdvertisedOnlyCipherSuite(
+                        server_hello.cipher_suite,
+                    ),
                 )
             })?;
 
